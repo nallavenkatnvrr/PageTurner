@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "PageTurner"
-APP_VERSION = "1.1.0"   # keep in step with installer\PageTurner.iss
+APP_VERSION = "1.1.1"   # keep in step with installer\PageTurner.iss
 
 # MuPDF prints harmless complaints about broken books (e.g. a stylesheet the
 # publisher forgot to include) to the console. The app handles these itself.
@@ -236,7 +236,7 @@ def _pdf_date(value):
     m = re.match(r"D?:?(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([Zz+\-])?(\d{2})?'?(\d{2})?", s)
     if not m:
         return None
-    y, mo, d, h, mi, se = (int(g) if g else dflt for g, dflt in zip(m.groups()[:6], (0, 1, 1, 1, 0, 0)))
+    y, mo, d, h, mi, se = (int(g) if g else dflt for g, dflt in zip(m.groups()[:6], (0, 1, 1, 1, 1, 0)))
     tz = datetime.timezone.utc
     if m.group(7) in ("+", "-") and m.group(8):
         off = datetime.timedelta(hours=int(m.group(8)), minutes=int(m.group(9) or 0))
@@ -537,6 +537,8 @@ class Reader(QMainWindow):
         self._password = None
         self.sig_results = None      # list of signature checks for the open PDF
         self.sig_fields = {}         # field name -> (page, rect)
+        self.sig_widget_xref = {}    # field name -> PDF object number of its widget
+        self._sig_ap_backup = {}     # original appearance streams we replaced on screen
         self._sig_token = 0
         self._sig_bridge = _SigBridge()
         self._sig_bridge.done.connect(self._signatures_checked)
@@ -1640,6 +1642,8 @@ class Reader(QMainWindow):
         self._sig_token += 1
         self.sig_results = None
         self.sig_fields = {}
+        self.sig_widget_xref = {}
+        self._sig_ap_backup = {}
         self.sig_bar.hide()
         self.sig_view.setHtml("<p style='color:#777'>This document has no digital signatures.</p>")
 
@@ -1659,6 +1663,7 @@ class Reader(QMainWindow):
                 rot = page.rotation_matrix
                 for w in page.widgets(types=[fitz.PDF_WIDGET_TYPE_SIGNATURE]):
                     self.sig_fields[w.field_name] = (page.number, fitz.Rect(w.rect) * rot)
+                    self.sig_widget_xref[w.field_name] = w.xref
         except Exception:
             pass
         try:
@@ -1698,6 +1703,114 @@ class Reader(QMainWindow):
             self._set_sig_bar("valid", "<b>Signed and all signatures are valid.</b>" if n > 1 else
                                        "<b>Signed and the signature is valid.</b>")
         self._fill_sig_panel()
+        try:
+            if self._show_sig_status_on_page():
+                self.render()
+        except Exception:
+            pass  # purely cosmetic - never let it break the reader
+
+    # Many signing tools (UIDAI e-Aadhaar, DSC tools, e-Sign services) still draw
+    # signatures the old Acrobat 6 way: a "?" mark and "Signature Not Verified"
+    # printed inside the signature box, which the viewer is expected to replace
+    # with the real result. Acrobat does this; so does PageTurner (on screen only -
+    # the file itself is never changed).
+    def _ref(self, xref, key):
+        try:
+            kind, val = self.doc.xref_get_key(xref, key)
+        except Exception:
+            return None
+        m = re.match(r"(\d+) 0 R", val or "") if kind == "xref" else None
+        return int(m.group(1)) if m else None
+
+    def _xobject_children(self, xref):
+        try:
+            kind, val = self.doc.xref_get_key(xref, "Resources/XObject")
+        except Exception:
+            return []
+        if kind == "xref":
+            sub = self._ref(xref, "Resources/XObject")
+            val = self.doc.xref_object(sub, compressed=True) if sub else ""
+        elif kind != "dict":
+            return []
+        return [(n, int(x)) for n, x in re.findall(r"/([A-Za-z0-9_.#-]+)\s+(\d+)\s+0\s+R", val)]
+
+    def _legacy_sig_layers(self, widget_xref):
+        start = self._ref(widget_xref, "AP/N")
+        found, seen, stack = {}, set(), [(start, 0)] if start else []
+        while stack:
+            x, depth = stack.pop()
+            if x in seen or depth > 4:
+                continue
+            seen.add(x)
+            for name, child in self._xobject_children(x):
+                if name in ("n1", "n2", "n3", "n4") and name not in found:
+                    found[name] = child
+                stack.append((child, depth + 1))
+        return found
+
+    def _bbox(self, xref):
+        try:
+            nums = [float(v) for v in re.findall(r"-?[\d.]+", self.doc.xref_get_key(xref, "BBox")[1])]
+            if len(nums) == 4:
+                return nums
+        except Exception:
+            pass
+        return [0, 0, 100, 100]
+
+    @staticmethod
+    def _status_mark(bbox, valid):
+        x0, y0, x1, y1 = bbox
+        w, h = x1 - x0, y1 - y0
+        sz = min(w, h)
+        cx, cy = x0 + w / 2, y0 + h / 2
+        lw = max(1.0, sz * 0.12)
+        if valid:   # green tick
+            path = (f"{cx - .36 * sz:.2f} {cy + .02 * sz:.2f} m {cx - .1 * sz:.2f} {cy - .28 * sz:.2f} l "
+                    f"{cx + .38 * sz:.2f} {cy + .32 * sz:.2f} l S")
+            col = "0.13 0.55 0.21 RG"
+        else:       # red cross
+            d = .3 * sz
+            path = (f"{cx - d:.2f} {cy - d:.2f} m {cx + d:.2f} {cy + d:.2f} l S "
+                    f"{cx - d:.2f} {cy + d:.2f} m {cx + d:.2f} {cy - d:.2f} l S")
+            col = "0.8 0.1 0.1 RG"
+        return f"q {col} {lw:.2f} w 1 J 1 j {path} Q".encode()
+
+    def _show_sig_status_on_page(self):
+        """Replaces the '?' / 'Signature Not Verified' placeholders with the real result."""
+        if self.doc is None:
+            return False
+        changed = bool(self._sig_ap_backup)
+        for x, data in self._sig_ap_backup.items():   # undo any earlier result first
+            self.doc.update_stream(x, data)
+        self._sig_ap_backup = {}
+        for r in self.sig_results or []:
+            wx = self.sig_widget_xref.get(r["field"])
+            if not wx or r["verdict"] == "unknown":
+                continue   # "not verified" is the honest result - leave it as drawn
+            valid = r["verdict"] == "valid"
+            layers = self._legacy_sig_layers(wx)
+            if not layers:
+                continue
+            if "n1" in layers:
+                x = layers["n1"]
+                self._sig_ap_backup[x] = self.doc.xref_stream(x)
+                self.doc.update_stream(x, self._status_mark(self._bbox(x), valid))
+            new_text = b"Signature valid" if valid else b"Signature invalid"
+            for name in ("n2", "n4"):
+                x = layers.get(name)
+                if not x:
+                    continue
+                old = self.doc.xref_stream(x) or b""
+                new = re.sub(rb"\(\s*Signature\s+Not\s+Verified\s*\)", b"(" + new_text + b")", old, flags=re.I)
+                if new == old and name == "n4":
+                    new = b""   # status text we can't rewrite in place: hide it rather than show a wrong one
+                if new != old:
+                    self._sig_ap_backup[x] = old
+                    self.doc.update_stream(x, new)
+            changed = True
+        if changed:
+            self.cache.clear()
+        return changed
 
     def _fill_sig_panel(self):
         dark = self.theme == "night"

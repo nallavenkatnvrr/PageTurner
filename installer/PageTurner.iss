@@ -1,8 +1,8 @@
 ; Inno Setup script for PageTurner. Built by build_installer.bat - you don't
-; need to run this by hand. Output: installer\Output\PageTurner-Setup-1.1.0.exe
+; need to run this by hand. Output: installer\Output\PageTurner-Setup-1.1.1.exe
 
 #define AppName "PageTurner"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.1"
 #define AppExe "PageTurner.exe"
 
 [Setup]

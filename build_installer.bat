@@ -1,7 +1,7 @@
 @echo off
 setlocal
 REM Builds PageTurner and packages it as a Windows installer (like 7-Zip's):
-REM   installer\Output\PageTurner-Setup-1.1.0.exe
+REM   installer\Output\PageTurner-Setup-1.1.1.exe
 cd /d "%~dp0"
 
 echo.
@@ -35,7 +35,7 @@ if not defined ISCC (
 
 echo.
 echo Done! Your installer is:
-echo   %~dp0installer\Output\PageTurner-Setup-1.1.0.exe
+echo   %~dp0installer\Output\PageTurner-Setup-1.1.1.exe
 start "" explorer "%~dp0installer\Output"
 pause
 exit /b 0
