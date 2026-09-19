@@ -1,0 +1,78 @@
+# Builds PageTurner-Setup-x.y.z.exe on a Windows machine at GitHub and
+# publishes it as a Release whenever you push a version tag (e.g. v1.1.0).
+# You can also run it by hand from the Actions tab to get a test build.
+
+name: Build installer and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build PageTurner.exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed --name PageTurner
+          --icon assets\logo.ico --add-data "assets;assets"
+          --collect-all pyhanko --collect-all pyhanko_certvalidator
+          --collect-submodules aiohttp --collect-data certifi
+          --version-file installer\version_info.txt pageturner.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        run: |
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup compiler (ISCC.exe) not found" }
+          & $iscc.FullName installer\PageTurner.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+          Get-ChildItem installer\Output
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PageTurner ${{ github.ref_name }}
+          files: installer/Output/PageTurner-Setup-*.exe
+          generate_release_notes: true
+          body: |
+            ## Download
+            **PageTurner-Setup-*.exe** below is the Windows 10/11 installer (64-bit).
+            Run it and follow the steps; it adds PageTurner to the Start menu and
+            "Open with PageTurner" to the right-click menu of PDF, EPUB, MOBI, FB2, XPS and CBZ files.
+
+            Windows may say "Windows protected your PC" because the installer isn't code-signed.
+            Click **More info → Run anyway**.
+
+            ## Highlights
+            - PDF, EPUB, MOBI, FB2, XPS and CBZ reading with themes (Light, Sepia, Night) and two-page view
+            - EPUB text size, font, spacing and margins; clickable links with Back navigation
+            - Acrobat-style digital signature verification with a signature panel
+            - Password-protected PDFs
+
+      - name: Keep the installer (manual runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: PageTurner-Setup
+          path: installer/Output/*.exe
