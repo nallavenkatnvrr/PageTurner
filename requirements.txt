@@ -1,0 +1,6 @@
+PySide6>=6.6
+PyMuPDF>=1.24
+pyHanko>=0.25
+pyhanko-certvalidator>=0.26
+aiohttp>=3.9
+certifi
