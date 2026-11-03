@@ -12,6 +12,7 @@ import logging
 import os
 import posixpath
 import re
+import shutil
 import sys
 import threading
 import zipfile
@@ -20,14 +21,15 @@ from bisect import bisect_right
 from collections import OrderedDict
 
 import pymupdf as fitz  # PyMuPDF
-from PySide6.QtCore import QEvent, QObject, QRectF, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QLocale, QObject, QRectF, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence,
-                           QPainter, QPixmap)
+                           QPageLayout, QPainter, QPixmap)
+from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDockWidget, QFileDialog, QPlainTextEdit, QTextBrowser,
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QMainWindow, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
     QSpinBox, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -62,6 +64,13 @@ FILE_FILTER = ("Books & documents (*.pdf *.epub *.mobi *.fb2 *.xps *.cbz);;"
                "PDF (*.pdf);;EPUB (*.epub);;All files (*.*)")
 ZOOM_PRESETS = ["Fit width", "Fit page", "50%", "75%", "100%",
                 "125%", "150%", "200%", "300%"]
+SAVE_FORMATS = {"pdf": "PDF document", "epub": "EPUB book", "mobi": "MOBI book",
+                "fb2": "FictionBook", "xps": "XPS document", "cbz": "Comic book archive"}
+PDF_FILTER = "PDF document (*.pdf)"
+PRINT_MAX_DPI = 300         # pages are sent to the printer as images of at most this resolution
+PRINT_BAND_PX = 1024        # ...rendered in strips this tall, so big pages don't need much memory
+PDF_MARGIN_PT = 54          # page margins when an EPUB/MOBI/FB2 book is saved as PDF (0.75 inch)
+PRINT_MARGIN_PT = 36        # ...and when it's printed (the printer adds its own margin on top)
 
 
 
@@ -155,6 +164,34 @@ def patch_epub(path):
                 if not name.startswith(".."):
                     w.writestr(name, "/* stylesheet missing from the original book */\n")
         return out.getvalue()
+
+
+def open_document(path):
+    """Opens a book or document with MuPDF, repairing broken EPUBs on the way."""
+    data = None
+    if path.lower().endswith(".epub"):
+        try:
+            data = patch_epub(path)
+        except Exception:
+            data = None  # unusual EPUB layout - open it as-is
+    return fitz.open(stream=data, filetype="epub") if data else fitz.open(path)
+
+
+def replace_file(target, write):
+    """
+    Calls write(temp_path) for a temporary file next to target, then swaps it
+    into place, so a failed or interrupted save never leaves half a file behind.
+    """
+    tmp = f"{target}.{os.getpid()}.part"
+    try:
+        write(tmp)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 
@@ -411,6 +448,8 @@ VERDICT_STYLE = {   # symbol, text colour, bar colour, bar border
 
 SHORTCUTS_HELP = """
 <b>Open</b>: Ctrl+O &nbsp; (or drag a file onto the window)<br>
+<b>Save a copy</b>: Ctrl+S<br>
+<b>Print</b>: Ctrl+P<br>
 <b>Next / previous page</b>: Right / Left, N / P<br>
 <b>Scroll down / up (turns page at the end)</b>: Space / Shift+Space, PgDn / PgUp, mouse wheel<br>
 <b>First / last page</b>: Home / End<br>
@@ -540,6 +579,7 @@ class Reader(QMainWindow):
         self.sig_widget_xref = {}    # field name -> PDF object number of its widget
         self._sig_ap_backup = {}     # original appearance streams we replaced on screen
         self._sig_token = 0
+        self._printer = None         # kept between prints so your printer choices stick
         self._sig_bridge = _SigBridge()
         self._sig_bridge.done.connect(self._signatures_checked)
 
@@ -603,6 +643,8 @@ class Reader(QMainWindow):
 
     def _build_actions(self):
         self.a_open = self._act("Open…", self.open_dialog, "Ctrl+O", "Open")
+        self.a_save = self._act("Save a copy…", self.save_copy_dialog, "Ctrl+S", "Save copy")
+        self.a_print = self._act("Print…", self.print_dialog, "Ctrl+P", "Print")
         self.a_quit = self._act("Exit", self.close, "Ctrl+Q")
         self.a_prev = self._act("Previous page", self.prev_page, ["Left", "P"], "◀")
         self.a_next = self._act("Next page", self.next_page, ["Right", "N"], "▶")
@@ -656,6 +698,8 @@ class Reader(QMainWindow):
         self.toolbar = tb
 
         tb.addAction(self.a_open)
+        tb.addAction(self.a_save)
+        tb.addAction(self.a_print)
         tb.addAction(self.a_toc)
         tb.addSeparator()
         tb.addAction(self.a_back)
@@ -705,6 +749,9 @@ class Reader(QMainWindow):
         m.addAction(self.a_open)
         self.recent_menu = m.addMenu("Open recent")
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        m.addSeparator()
+        m.addAction(self.a_save)
+        m.addAction(self.a_print)
         m.addSeparator()
         m.addAction(self.a_quit)
 
@@ -890,7 +937,7 @@ class Reader(QMainWindow):
         has = self.doc is not None
         self.a_back.setEnabled(has and bool(self.history))
         for a in (self.a_prev, self.a_next, self.a_first, self.a_last, self.a_goto,
-                  self.a_fnext, self.a_fprev, self.a_pgdn, self.a_pgup):
+                  self.a_fnext, self.a_fprev, self.a_pgdn, self.a_pgup, self.a_save, self.a_print):
             a.setEnabled(has)
         zoomable = has and not self._is_book_fill()
         for a in (self.a_fitw, self.a_fitp):
@@ -919,13 +966,7 @@ class Reader(QMainWindow):
     def open_file(self, path):
         path = os.path.abspath(path)
         try:
-            data = None
-            if path.lower().endswith(".epub"):
-                try:
-                    data = patch_epub(path)
-                except Exception:
-                    data = None  # unusual EPUB layout - open it as-is
-            doc = fitz.open(stream=data, filetype="epub") if data else fitz.open(path)
+            doc = open_document(path)
         except Exception as ex:
             QMessageBox.warning(self, APP, f"Couldn't open this file.\n\n{path}\n\n{ex}")
             return
@@ -971,8 +1012,7 @@ class Reader(QMainWindow):
         self._apply_theme()
         self._update_ui()
 
-        title = (doc.metadata or {}).get("title") or os.path.basename(path)
-        self.setWindowTitle(f"{title} - {APP}")
+        self.setWindowTitle(f"{self._doc_title()} - {APP}")
         self._add_recent(path)
         self.settings.setValue("last_file", path)
         self.settings.setValue("last_dir", os.path.dirname(path))
@@ -981,6 +1021,9 @@ class Reader(QMainWindow):
 
     def _kind(self):
         return "epub" if self.doc is not None and self.doc.is_reflowable else "pdf"
+
+    def _doc_title(self):
+        return (self.doc.metadata or {}).get("title") or os.path.basename(self.path)
 
     def _key(self):
         return hashlib.md5(os.path.normcase(self.path).encode("utf-8")).hexdigest()
@@ -1082,9 +1125,13 @@ class Reader(QMainWindow):
         return self._toc_titles[i] if i >= 0 else ""
 
     # --------------------------------------------------------- book layout
-    def _epub_css(self):
-        m = MARGINS.get(self.epub_margin, 2.5)
-        css = [f"@page {{ margin: 2em {m}em; }}"]
+    def _epub_css(self, paper_margin=None):
+        """Book stylesheet. paper_margin (points) replaces the screen margins for print / PDF."""
+        if paper_margin is None:
+            m = MARGINS.get(self.epub_margin, 2.5)
+            css = [f"@page {{ margin: 2em {m}em; }}"]
+        else:
+            css = [f"@page {{ margin: {paper_margin}pt; }}"]
         fam = FONTS.get(self.epub_family)
         if fam:
             css.append("body, p, li, blockquote, dd, dt, td, th, h1, h2, h3, h4, h5, h6 "
@@ -1603,6 +1650,400 @@ class Reader(QMainWindow):
         cx, cy = ox + sx + (r.x0 + r.x1) / 2 * z, oy + sy + (r.y0 + r.y1) / 2 * z
         self.view.ensureVisible(int(cx), int(cy), 120, self.view.viewport().height() // 3)
 
+    # ------------------------------------------------------------- saving
+    def save_copy_dialog(self):
+        """
+        Saves a copy of the open document. Normally the copy is the original file byte
+        for byte, so digital signatures, passwords, forms and attachments stay intact.
+        A signed PDF whose signature status PageTurner has drawn on the page (the tick)
+        can instead be saved as shown, with the tick - see save_copy_as_shown.
+        EPUB, MOBI, FB2, XPS and CBZ files can also be saved as a PDF version.
+        """
+        if self.doc is None or not self.path:
+            return
+        if not os.path.isfile(self.path):
+            QMessageBox.warning(self, APP, "The original file was moved or deleted after it was opened, "
+                                           f"so a copy can't be made.\n\n{self.path}")
+            return
+        src_dir = os.path.dirname(self.path)
+        stem, ext = os.path.splitext(os.path.basename(self.path))
+        ext = ext.lower()
+        folder = self.settings.value("save_dir", "") or src_dir
+        if not os.path.isdir(folder):
+            folder = src_dir
+        if os.path.normcase(os.path.abspath(folder)) == os.path.normcase(src_dir):
+            name = self._free_copy_name(folder, stem, ext)   # "report (copy).pdf"
+        else:
+            name = stem + ext
+
+        # A signed PDF showing its signature status on the page can also be saved as shown.
+        shown_status = bool(self.doc.is_pdf and self._sig_ap_backup)
+        kind = SAVE_FORMATS.get(ext[1:], ext[1:].upper() + " file") if ext else "All files"
+        if shown_status:
+            same = f"{kind}, exact copy - stays digitally signed (*{ext or ''})"
+            mark = "tick" if any(r["verdict"] == "valid" for r in self.sig_results or []) else "status"
+            as_shown = f"PDF with the signature {mark} as shown - not digitally signed (*.pdf)"
+        else:
+            same = f"{kind} (*{ext})" if ext else "All files (*)"
+            as_shown = None
+        filters = [same] if self.doc.is_pdf else [same, PDF_FILTER]
+        initial = same
+        if as_shown:
+            filters.append(as_shown)
+            if self.settings.value("save_as_shown", True, type=bool):
+                initial = as_shown
+        target, chosen = QFileDialog.getSaveFileName(self, "Save a copy", os.path.join(folder, name),
+                                                     ";;".join(filters), initial)
+        if not target:
+            return
+        target = os.path.abspath(target)
+        with_status = as_shown is not None and chosen == as_shown
+        if as_shown is not None:
+            self.settings.setValue("save_as_shown", with_status)   # offer the same choice next time
+        as_pdf = not self.doc.is_pdf and (chosen == PDF_FILTER or target.lower().endswith(".pdf"))
+        want = ".pdf" if as_pdf or with_status else ext
+        if want and not target.lower().endswith(want):
+            target += want   # the save box only confirmed overwriting the name without it
+            if os.path.exists(target) and QMessageBox.question(
+                    self, "Save a copy", f"{os.path.basename(target)} already exists.\n"
+                                         "Do you want to replace it?") != QMessageBox.Yes:
+                return
+        if os.path.exists(target) and os.path.samefile(target, self.path):
+            QMessageBox.information(self, "Save a copy", "That's the file you have open. Choose a "
+                                                         "different name or folder for the copy.")
+            return
+
+        error = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if as_pdf:
+                self.save_pdf_version(target)
+            elif with_status:
+                self.save_copy_as_shown(target)
+            else:
+                self.save_copy(target)
+        except Exception as ex:
+            error = ex
+        finally:
+            QApplication.restoreOverrideCursor()
+        if error is not None:
+            QMessageBox.warning(self, APP, f"The copy couldn't be saved.\n\n{target}\n\n{error}")
+            return
+        self.settings.setValue("save_dir", os.path.dirname(target))
+        if with_status:
+            self.statusBar().showMessage(f"Saved a copy with the signature {mark} to {target}  "
+                                         "(not digitally signed)", 10000)
+        else:
+            what = "a PDF version" if as_pdf else "a copy"
+            self.statusBar().showMessage(f"Saved {what} to {target}", 8000)
+
+    @staticmethod
+    def _free_copy_name(folder, stem, ext):
+        for i in range(1, 1000):
+            name = f"{stem} (copy){ext}" if i == 1 else f"{stem} (copy {i}){ext}"
+            if not os.path.exists(os.path.join(folder, name)):
+                return name
+        return f"{stem} (copy){ext}"
+
+    def save_copy(self, target):
+        """Copies the open file to target exactly as it is on disk."""
+        replace_file(target, lambda tmp: shutil.copyfile(self.path, tmp))
+
+    def save_copy_as_shown(self, target):
+        """
+        Saves the PDF as it looks on screen: the signature box shows the real result
+        (a tick and "Signature valid") instead of the "?" / "Signature Not Verified"
+        placeholder, in every PDF viewer and on paper.
+
+        Signature checkers (Acrobat, PageTurner, ...) treat ANY change to a signed
+        signature's appearance as tampering and would report the signature as invalid.
+        So instead of leaving a signature that looks broken, the signature boxes (and
+        any form fields) are flattened into the page: the copy looks exactly like the
+        screen but is no longer digitally signed. The password, if any, is kept.
+        """
+        flat = fitz.open("pdf", self.doc.tobytes(encryption=fitz.PDF_ENCRYPT_KEEP))
+        try:
+            if flat.needs_pass and not flat.authenticate(self._password or ""):
+                raise RuntimeError("the document's password wasn't accepted")
+            flat.bake(annots=False, widgets=True)
+            try:   # drop the certification entry that pointed at the removed signature
+                flat.xref_set_key(flat.pdf_catalog(), "Perms", "null")
+            except Exception:
+                pass
+            replace_file(target, lambda tmp: flat.save(tmp, garbage=3, deflate=True,
+                                                       encryption=fitz.PDF_ENCRYPT_KEEP))
+        finally:
+            flat.close()
+
+    def save_pdf_version(self, target):
+        """Writes a PDF version of the open book or document, with its table of contents."""
+        if self.doc.is_reflowable:
+            # Lay the book out on real paper instead of the shape of the window.
+            letter = QLocale().measurementSystem() == QLocale.MeasurementSystem.ImperialUSSystem
+            src = self._book_on_paper(*((612, 792) if letter else (595, 842)), PDF_MARGIN_PT)
+        else:
+            src = self.doc
+        try:
+            pdf = fitz.open("pdf", src.convert_to_pdf())
+            try:
+                pdf.set_toc(self._clean_toc(src.get_toc(simple=True), pdf.page_count))
+            except Exception:
+                pass   # a table of contents is nice to have, not essential
+            meta = {k: v for k, v in (src.metadata or {}).items()
+                    if k in ("title", "author", "subject", "keywords") and v}
+            meta["creator"] = f"{APP} {APP_VERSION}"
+            try:
+                pdf.set_metadata(meta)
+            except Exception:
+                pass
+            replace_file(target, lambda tmp: pdf.save(tmp, garbage=3, deflate=True))
+            pdf.close()
+        finally:
+            if src is not self.doc:
+                src.close()
+
+    @staticmethod
+    def _clean_toc(toc, page_count):
+        """Drops entries that point nowhere and fixes level jumps, which PDF outlines don't allow."""
+        out, prev = [], 0
+        for entry in toc:
+            level, title, page = entry[0], entry[1], entry[2]
+            if not 1 <= page <= page_count:
+                continue
+            level = max(1, min(level, prev + 1))
+            out.append([level, (title or "").strip() or "(untitled)", page])
+            prev = level
+        return out
+
+    def _book_on_paper(self, width, height, margin):
+        """A separate copy of the open EPUB/MOBI/FB2 book laid out on paper (sizes in points).
+        The copy on screen keeps its own layout and reading position."""
+        d = open_document(self.path)
+        try:
+            d.apply_css(self._epub_css(paper_margin=margin))
+            d.layout(width=width, height=height, fontsize=self.font_size)
+        except Exception:
+            d.close()
+            raise
+        return d
+
+    def _matching_page(self, other):
+        """The page of `other` (the same book laid out differently) where you're reading now."""
+        try:
+            ch, pg = self.doc.location_from_page_number(self.page_no)
+            frac = pg / max(1, self.doc.chapter_page_count(ch))
+            n = other.chapter_page_count(ch)
+            return other.page_number_from_location((ch, max(0, min(n - 1, int(frac * n)))))
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------ printing
+    def _get_printer(self):
+        if self._printer is None:
+            self._printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            name = self.settings.value("printer", "")
+            if name and name in QPrinterInfo.availablePrinterNames():
+                self._printer.setPrinterName(name)
+        return self._printer
+
+    def _print_source(self, printer):
+        """The document to print: the open one, or for books a copy laid out on the chosen paper."""
+        if not self.doc.is_reflowable:
+            return self.doc
+        r = printer.pageLayout().paintRect(QPageLayout.Unit.Point)
+        return self._book_on_paper(r.width(), r.height(), PRINT_MARGIN_PT)
+
+    def print_dialog(self):
+        """Shows the Windows print dialog and prints the chosen pages."""
+        if self.doc is None:
+            return
+        if self.doc.is_pdf and not (self.doc.permissions & fitz.PDF_PERM_PRINT):
+            QMessageBox.information(self, "Print", "The author of this PDF doesn't allow it to be printed.")
+            return
+        printer = self._get_printer()
+        title = self._doc_title()
+        printer.setDocName(title)
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            src = self._print_source(printer)
+        except Exception as ex:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, APP, f"This book couldn't be prepared for printing.\n\n{ex}")
+            return
+        QApplication.restoreOverrideCursor()
+        paper = printer.pageLayout().paintRect(QPageLayout.Unit.Point).size()
+
+        try:
+            count = src.page_count
+            printer.setPrintRange(QPrinter.PrintRange.AllPages)
+            printer.setFromTo(1, count)
+            dlg = QPrintDialog(printer, self)
+            dlg.setWindowTitle(f"Print - {title}")
+            Opt = QAbstractPrintDialog.PrintDialogOption
+            dlg.setOption(Opt.PrintCurrentPage, True)
+            dlg.setOption(Opt.PrintPageRange, True)
+            dlg.setOption(Opt.PrintCollateCopies, True)
+            dlg.setOption(Opt.PrintSelection, False)
+            dlg.setOption(Opt.PrintToFile, False)
+            dlg.setMinMax(1, count)
+            if not dlg.exec():
+                return
+
+            if src is not self.doc and printer.pageLayout().paintRect(QPageLayout.Unit.Point).size() != paper:
+                # A different paper size or orientation was picked: lay the book out again.
+                src.close()
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    src = self._print_source(printer)
+                except Exception as ex:
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.warning(self, APP, f"This book couldn't be prepared for printing.\n\n{ex}")
+                    return
+                QApplication.restoreOverrideCursor()
+            if src is self.doc:
+                current = self._visible_pages()
+            else:
+                current = [self._matching_page(src)]
+            pages = self.pages_to_print(printer, src.page_count, current)
+            if not pages:
+                return
+            try:
+                result = self.print_pages(printer, src, pages)
+            except Exception as ex:
+                QMessageBox.warning(self, APP, f"Printing stopped because of an error.\n\n{ex}")
+                return
+        finally:
+            if src is not self.doc and not src.is_closed:
+                src.close()
+
+        where = printer.printerName() or printer.outputFileName() or "the printer"
+        if result == "done":
+            self.settings.setValue("printer", printer.printerName())
+            n = len(pages)
+            self.statusBar().showMessage(f"Sent {n} page{'s' if n != 1 else ''} to {where}.", 8000)
+        elif result == "cancelled":
+            self.statusBar().showMessage("Printing cancelled.", 5000)
+        else:
+            QMessageBox.warning(
+                self, "Print", f"Printing didn't start on “{where}”.\n\n"
+                               "If the printer asked where to save a file and you cancelled, nothing "
+                               "was printed. Otherwise, check that the printer is switched on and "
+                               "connected, then try again.")
+
+    @staticmethod
+    def pages_to_print(printer, count, current):
+        """The 0-based page numbers picked in the print dialog."""
+        rng = printer.printRange()
+        if rng == QPrinter.PrintRange.CurrentPage:
+            return [p for p in current if 0 <= p < count]
+        if rng == QPrinter.PrintRange.PageRange:
+            pages = []
+            ranges = printer.pageRanges()
+            if not ranges.isEmpty():
+                pages = [p - 1 for p in range(max(1, ranges.firstPage()), min(count, ranges.lastPage()) + 1)
+                         if ranges.contains(p)]
+            elif printer.fromPage() > 0:
+                pages = list(range(printer.fromPage() - 1, min(count, max(printer.fromPage(), printer.toPage()))))
+            return pages
+        return list(range(count))
+
+    def print_pages(self, printer, doc, pages):
+        """Prints the given pages. Returns 'done', 'cancelled' or 'failed' (printer wouldn't start)."""
+        seq = list(pages)
+        if printer.pageOrder() == QPrinter.PageOrder.LastPageFirst:
+            seq.reverse()
+        copies = 1 if printer.supportsMultipleCopies() else max(1, printer.copyCount())
+        if copies > 1:   # the printer can't make copies itself, so send each page several times
+            seq = seq * copies if printer.collateCopies() else [p for p in seq for _ in range(copies)]
+        gray = printer.colorMode() == QPrinter.ColorMode.GrayScale
+        max_dpi = PRINT_MAX_DPI
+        if doc.is_pdf and not (doc.permissions & fitz.PDF_PERM_PRINT_HQ):
+            max_dpi = 150   # the PDF only allows low-quality printing
+
+        painter = QPainter()
+        if not painter.begin(printer):
+            return "failed"
+        progress = None
+        if len(seq) > 1:
+            progress = QProgressDialog("Preparing pages…", "Cancel", 0, len(seq), self)
+            progress.setWindowTitle("Printing")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(400)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+        try:
+            for i, pno in enumerate(seq):
+                if progress is not None:
+                    progress.setLabelText(f"Printing page {pno + 1}  ({i + 1} of {len(seq)})")
+                    progress.setValue(i)
+                    if progress.wasCanceled():
+                        printer.abort()
+                        return "cancelled"
+                if i and not printer.newPage():
+                    raise RuntimeError("The printer stopped accepting pages.")
+                self.paint_page_for_print(painter, printer, doc.load_page(pno), gray, max_dpi)
+            return "done"
+        except Exception:
+            printer.abort()
+            raise
+        finally:
+            if painter.isActive():
+                painter.end()
+            if progress is not None:
+                progress.close()
+
+    @staticmethod
+    def paint_page_for_print(painter, printer, page, gray=False, max_dpi=PRINT_MAX_DPI):
+        """
+        Draws one page in the printable area of the paper, centred, in its real colours
+        (themes don't apply). Pages too big for the paper are shrunk to fit, never enlarged;
+        landscape pages on portrait paper (and the other way round) are turned to fit.
+        The page is rendered in horizontal strips to keep memory use low.
+        """
+        dpx, dpy = printer.logicalDpiX(), printer.logicalDpiY()
+        area_w, area_h = printer.width(), printer.height()   # printable area, device pixels
+        prect = page.rect
+        pw, ph = prect.width, prect.height
+        if pw <= 0 or ph <= 0 or area_w <= 0 or area_h <= 0:
+            return
+        aw, ah = area_w / dpx * 72, area_h / dpy * 72         # printable area, points
+        turn = (pw > ph * 1.02 and ah > aw * 1.02) or (ph > pw * 1.02 and aw > ah * 1.02)
+        fit_w, fit_h = (ph, pw) if turn else (pw, ph)
+        k = min(1.0, aw / fit_w, ah / fit_h)
+        scale = k * min(max_dpi, max(dpx, dpy)) / 72          # render pixels per page point
+        # device pixels per render pixel, along the page's width and height
+        ux = k * (dpy if turn else dpx) / 72 / scale
+        uy = k * (dpx if turn else dpy) / 72 / scale
+
+        dl = page.get_displaylist()
+        m = fitz.Matrix(scale, scale)
+        full = (prect * m).irect
+        cs, fmt = (fitz.csGRAY, QImage.Format_Grayscale8) if gray else (fitz.csRGB, QImage.Format_RGB888)
+        painter.save()
+        try:
+            painter.translate(area_w / 2, area_h / 2)
+            if turn:
+                painter.rotate(-90)   # top of the page goes to the left edge of the paper
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            x0, y0 = -full.width * ux / 2, -full.height * uy / 2
+            band = max(1.0, PRINT_BAND_PX / scale)              # strip height, points
+            y = prect.y0
+            while y < prect.y1:
+                y1 = min(prect.y1, y + band)
+                # each strip reaches one pixel into the next, so no gaps show between them
+                clip = fitz.Rect(prect.x0, y, prect.x1, min(prect.y1, y1 + 1 / scale))
+                pix = dl.get_pixmap(matrix=m, colorspace=cs, alpha=False, clip=clip)
+                if pix.width and pix.height:
+                    buf = pix.samples   # must outlive the QImage that points into it
+                    img = QImage(buf, pix.width, pix.height, pix.stride, fmt)
+                    painter.drawImage(QRectF(x0 + (pix.x - full.x0) * ux, y0 + (pix.y - full.y0) * uy,
+                                             pix.width * ux, pix.height * uy), img)
+                y = y1
+                QApplication.processEvents()
+        finally:
+            painter.restore()
+
     # --------------------------------------------------------- misc events
     # ----------------------------------------------------------- signatures
     def _build_sig_bar(self):
@@ -1712,8 +2153,9 @@ class Reader(QMainWindow):
     # Many signing tools (UIDAI e-Aadhaar, DSC tools, e-Sign services) still draw
     # signatures the old Acrobat 6 way: a "?" mark and "Signature Not Verified"
     # printed inside the signature box, which the viewer is expected to replace
-    # with the real result. Acrobat does this; so does PageTurner (on screen only -
-    # the file itself is never changed).
+    # with the real result. Acrobat does this; so does PageTurner (on screen and in
+    # print-outs - the file itself is never changed; "Save a copy" can write a
+    # separate, flattened copy as shown).
     def _ref(self, xref, key):
         try:
             kind, val = self.doc.xref_get_key(xref, key)
