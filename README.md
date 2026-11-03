@@ -19,6 +19,16 @@ A lightweight reader built on Qt (PySide6) and MuPDF. Opens PDF, EPUB, MOBI, FB2
 - **Digital signature verification** like Acrobat: a coloured bar says whether signatures are
   valid, and the Signature panel (Ctrl+Shift+S) shows who signed, when, whether the document was
   changed afterwards, and the certificate. Click a signature on the page to see its details.
+- **Print** (Ctrl+P) with the normal Windows print dialog: choose the printer, all pages, the
+  current page or a page range, copies and colour/black & white. Pages are printed in their real
+  colours (whatever the theme), centred, shrunk only if they're bigger than the paper, and
+  landscape pages are turned to fit portrait paper. EPUB, MOBI and FB2 books are laid out on the
+  paper you choose, using your font and text size. PDFs whose author turned printing off can't
+  be printed (as in Acrobat).
+- **Save a copy** (Ctrl+S): saves an exact copy of the file - nothing is re-written, so digital
+  signatures, passwords, forms and attachments stay intact. EPUB, MOBI, FB2, XPS and CBZ files
+  can also be saved as a PDF (pick "PDF document" as the file type); the PDF keeps the table of
+  contents and real, searchable text.
 - Password-protected PDFs (you're asked for the password; signatures are checked too)
 - Starts on a clean welcome screen with your recent files
 - Full screen, drag-and-drop, recent files, password-protected PDFs
