@@ -1653,9 +1653,10 @@ class Reader(QMainWindow):
     # ------------------------------------------------------------- saving
     def save_copy_dialog(self):
         """
-        Saves a copy of the open document. The copy is the original file byte for
-        byte, so digital signatures, passwords, forms and attachments stay intact
-        (on-screen changes such as the signature tick are never written into it).
+        Saves a copy of the open document. Normally the copy is the original file byte
+        for byte, so digital signatures, passwords, forms and attachments stay intact.
+        A signed PDF whose signature status PageTurner has drawn on the page (the tick)
+        can instead be saved as shown, with the tick - see save_copy_as_shown.
         EPUB, MOBI, FB2, XPS and CBZ files can also be saved as a PDF version.
         """
         if self.doc is None or not self.path:
@@ -1675,18 +1676,32 @@ class Reader(QMainWindow):
         else:
             name = stem + ext
 
-        if ext:
-            same = f"{SAVE_FORMATS.get(ext[1:], ext[1:].upper() + ' file')} (*{ext})"
+        # A signed PDF showing its signature status on the page can also be saved as shown.
+        shown_status = bool(self.doc.is_pdf and self._sig_ap_backup)
+        kind = SAVE_FORMATS.get(ext[1:], ext[1:].upper() + " file") if ext else "All files"
+        if shown_status:
+            same = f"{kind}, exact copy - stays digitally signed (*{ext or ''})"
+            mark = "tick" if any(r["verdict"] == "valid" for r in self.sig_results or []) else "status"
+            as_shown = f"PDF with the signature {mark} as shown - not digitally signed (*.pdf)"
         else:
-            same = "All files (*)"
+            same = f"{kind} (*{ext})" if ext else "All files (*)"
+            as_shown = None
         filters = [same] if self.doc.is_pdf else [same, PDF_FILTER]
+        initial = same
+        if as_shown:
+            filters.append(as_shown)
+            if self.settings.value("save_as_shown", True, type=bool):
+                initial = as_shown
         target, chosen = QFileDialog.getSaveFileName(self, "Save a copy", os.path.join(folder, name),
-                                                     ";;".join(filters))
+                                                     ";;".join(filters), initial)
         if not target:
             return
         target = os.path.abspath(target)
+        with_status = as_shown is not None and chosen == as_shown
+        if as_shown is not None:
+            self.settings.setValue("save_as_shown", with_status)   # offer the same choice next time
         as_pdf = not self.doc.is_pdf and (chosen == PDF_FILTER or target.lower().endswith(".pdf"))
-        want = ".pdf" if as_pdf else ext
+        want = ".pdf" if as_pdf or with_status else ext
         if want and not target.lower().endswith(want):
             target += want   # the save box only confirmed overwriting the name without it
             if os.path.exists(target) and QMessageBox.question(
@@ -1703,6 +1718,8 @@ class Reader(QMainWindow):
         try:
             if as_pdf:
                 self.save_pdf_version(target)
+            elif with_status:
+                self.save_copy_as_shown(target)
             else:
                 self.save_copy(target)
         except Exception as ex:
@@ -1713,8 +1730,12 @@ class Reader(QMainWindow):
             QMessageBox.warning(self, APP, f"The copy couldn't be saved.\n\n{target}\n\n{error}")
             return
         self.settings.setValue("save_dir", os.path.dirname(target))
-        what = "a PDF version" if as_pdf else "a copy"
-        self.statusBar().showMessage(f"Saved {what} to {target}", 8000)
+        if with_status:
+            self.statusBar().showMessage(f"Saved a copy with the signature {mark} to {target}  "
+                                         "(not digitally signed)", 10000)
+        else:
+            what = "a PDF version" if as_pdf else "a copy"
+            self.statusBar().showMessage(f"Saved {what} to {target}", 8000)
 
     @staticmethod
     def _free_copy_name(folder, stem, ext):
@@ -1727,6 +1748,32 @@ class Reader(QMainWindow):
     def save_copy(self, target):
         """Copies the open file to target exactly as it is on disk."""
         replace_file(target, lambda tmp: shutil.copyfile(self.path, tmp))
+
+    def save_copy_as_shown(self, target):
+        """
+        Saves the PDF as it looks on screen: the signature box shows the real result
+        (a tick and "Signature valid") instead of the "?" / "Signature Not Verified"
+        placeholder, in every PDF viewer and on paper.
+
+        Signature checkers (Acrobat, PageTurner, ...) treat ANY change to a signed
+        signature's appearance as tampering and would report the signature as invalid.
+        So instead of leaving a signature that looks broken, the signature boxes (and
+        any form fields) are flattened into the page: the copy looks exactly like the
+        screen but is no longer digitally signed. The password, if any, is kept.
+        """
+        flat = fitz.open("pdf", self.doc.tobytes(encryption=fitz.PDF_ENCRYPT_KEEP))
+        try:
+            if flat.needs_pass and not flat.authenticate(self._password or ""):
+                raise RuntimeError("the document's password wasn't accepted")
+            flat.bake(annots=False, widgets=True)
+            try:   # drop the certification entry that pointed at the removed signature
+                flat.xref_set_key(flat.pdf_catalog(), "Perms", "null")
+            except Exception:
+                pass
+            replace_file(target, lambda tmp: flat.save(tmp, garbage=3, deflate=True,
+                                                       encryption=fitz.PDF_ENCRYPT_KEEP))
+        finally:
+            flat.close()
 
     def save_pdf_version(self, target):
         """Writes a PDF version of the open book or document, with its table of contents."""
@@ -2106,8 +2153,9 @@ class Reader(QMainWindow):
     # Many signing tools (UIDAI e-Aadhaar, DSC tools, e-Sign services) still draw
     # signatures the old Acrobat 6 way: a "?" mark and "Signature Not Verified"
     # printed inside the signature box, which the viewer is expected to replace
-    # with the real result. Acrobat does this; so does PageTurner (on screen only -
-    # the file itself is never changed).
+    # with the real result. Acrobat does this; so does PageTurner (on screen and in
+    # print-outs - the file itself is never changed; "Save a copy" can write a
+    # separate, flattened copy as shown).
     def _ref(self, xref, key):
         try:
             kind, val = self.doc.xref_get_key(xref, key)

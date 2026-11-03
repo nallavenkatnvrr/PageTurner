@@ -29,6 +29,13 @@ A lightweight reader built on Qt (PySide6) and MuPDF. Opens PDF, EPUB, MOBI, FB2
   signatures, passwords, forms and attachments stay intact. EPUB, MOBI, FB2, XPS and CBZ files
   can also be saved as a PDF (pick "PDF document" as the file type); the PDF keeps the table of
   contents and real, searchable text.
+- **Save a signed PDF with the signature tick**: for signatures drawn the old way ("?" and
+  "Signature Not Verified", e.g. e-Aadhaar), pick "PDF with the signature tick as shown" in Save
+  a copy. The copy shows the tick and "Signature valid" in every PDF viewer and when printed.
+  Signature checkers treat any change to a signature's appearance as tampering, so this copy
+  has its signature flattened into the page: it looks exactly like the screen, keeps its
+  password, but is **not digitally signed**. Use the exact copy wherever the signature itself
+  must be verified (PageTurner remembers which of the two you chose last).
 - Password-protected PDFs (you're asked for the password; signatures are checked too)
 - Starts on a clean welcome screen with your recent files
 - Full screen, drag-and-drop, recent files, password-protected PDFs
